@@ -94,30 +94,32 @@ If a team lead or developer signs in but workspace loading returns 403, restart 
 
 ## Deploy to Azure (on demand, for demos)
 
-Runs on Azure Container Apps and costs roughly $5–10/month while stopped (database storage plus the registry). Nothing is billed for compute while it's off.
+Runs on Azure Container Apps, started for interviews and stopped otherwise. While stopped, the only cost is the small file share holding the database (a few rupees a month).
 
-| Piece | Azure resource |
+| Piece | Where it runs |
 |---|---|
 | Frontend (nginx, public) | Container App `pulsedesk-web`; proxies `/api` to the backend |
 | Backend + Redis sidecar (internal only) | Container App `pulsedesk-api`, one replica |
-| Database | PostgreSQL Flexible Server, Burstable B1ms, 32 GB |
-| Images | Azure Container Registry, Basic |
+| Database | Container App `pulsedesk-db` (Postgres 16, internal TCP only) with its data on an Azure Files share |
+| Images | GitHub Container Registry, published by CI after the tests pass on `main` |
 | Safety net | Container Apps job `pulsedesk-autostop` stops everything nightly at 01:00 IST |
 
-Needs Azure CLI, Docker Desktop, and Owner rights on the subscription (the auto-stop job gets a role assignment).
+Needs Azure CLI and Owner rights on the subscription (the auto-stop job gets a role assignment). No Docker needed on your machine.
 
 ```powershell
 az login
-.\scripts\azure\deploy.ps1                       # first run ~15 min; prints the public URL
+git push                                          # then wait for CI's "Docker images" job
+.\scripts\azure\deploy.ps1                        # deploys the images for the current commit
 .\scripts\seed-demo.ps1 -Base https://<url>/api/v1 # once, to load the demo org
-.\scripts\azure\demo-up.ps1                      # before an interview (~5-10 min)
-.\scripts\azure\demo-down.ps1                    # afterwards
-.\scripts\azure\custom-domain.ps1                # once: serve it at pulsedesk.anshrai.in with free HTTPS
+.\scripts\azure\custom-domain.ps1                 # once: serve it at pulsedesk.anshrai.in with free HTTPS
+.\scripts\azure\demo-up.ps1                       # before an interview (2-3 min)
+.\scripts\azure\demo-down.ps1                     # afterwards
 ```
 
-- Re-run `deploy.ps1` to ship new code. It regenerates the JWT secret and database password, so everyone signs in again.
+- The GitHub packages `pulsedesk-api` and `pulsedesk-web` must be public (Package settings > Change visibility) so Azure can pull them without credentials.
+- Re-run `deploy.ps1` to ship new code. It regenerates the JWT secret, so everyone signs in again; the database and its password are kept.
 - Email is off in Azure (`PULSEDESK_MESSAGING_ENABLED=false`); there's no RabbitMQ there.
-- The database accepts connections only from Azure services, with TLS required.
+- The database has no backups. If its data is lost, `seed-demo.ps1` recreates the demo org.
 - To run the same containers locally: set `PULSEDESK_JWT_SECRET`, then `docker compose -f docker-compose.yml -f docker-compose.app.yml up -d --build` and open http://localhost:8081.
 
 ## Tests

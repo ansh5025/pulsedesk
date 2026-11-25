@@ -1,71 +1,73 @@
-# Creates or updates PulseDesk on Azure: infrastructure, images and apps.
-# Usage: az login; .\scripts\azure\deploy.ps1 [-ResourceGroup pulsedesk-rg] [-Location japaneast]
-# Re-running is safe; it builds fresh images. Each run regenerates the JWT secret, so users sign in again.
-# Japan East is the default because Azure for Students subscriptions get SkuNotAvailable for the B1ms
-# database in several closer regions (tested: Central India, Southeast Asia, Korea Central; South India,
-# East US and West Europe are blocked outright). Pick another region with -Location if yours allows it.
+# Creates or updates PulseDesk on Azure from the images CI published for the current commit.
+# Usage: az login; .\scripts\azure\deploy.ps1 [-ResourceGroup pulsedesk-rg] [-Location japaneast] [-Tag <commit sha>]
+# Push your commit first and wait for the CI "Docker images" job: it publishes ghcr.io/<owner>/pulsedesk-{api,web}:<sha>.
+# Each run regenerates the JWT secret, so users sign in again. The database password and data are kept.
+# Japan East is the default because Azure for Students subscriptions hit SkuNotAvailable or region blocks
+# in several closer regions. Pick another with -Location if yours allows it.
 param(
     [string]$ResourceGroup = 'pulsedesk-rg',
-    [string]$Location = 'japaneast'
+    [string]$Location = 'japaneast',
+    [string]$Tag = ''
 )
 . "$PSScriptRoot\common.ps1"
 $root = (Resolve-Path "$PSScriptRoot\..\..").Path
 $template = Join-Path $root 'infra\main.bicep'
 
 Assert-SignedIn
-Invoke-Quiet { docker version --format '{{.Server.Version}}' } | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Docker is not running. Start Docker Desktop and try again.' }
 
-Write-Host '1/5 Resource group'
+Write-Host '1/4 Checking the images'
+if (-not $Tag) { $Tag = (git -C $root rev-parse HEAD).Trim() }
+$remote = (git -C $root remote get-url origin).Trim()
+if ($remote -notmatch 'github\.com[:/]([^/]+)/') { throw "Can't work out the GitHub owner from remote '$remote'." }
+$owner = $Matches[1].ToLower()
+$images = @{}
+foreach ($name in 'pulsedesk-api', 'pulsedesk-web') {
+    $repo = "$owner/$name"
+    switch (Test-PublicImage $repo $Tag) {
+        'ok' { $images[$name] = "ghcr.io/$($repo):$Tag"; Write-Host "  ghcr.io/$($repo):$Tag" }
+        'missing' { throw "ghcr.io/$($repo):$Tag doesn't exist yet. Push this commit and wait for the CI 'Docker images' job to finish." }
+        'private' { throw "ghcr.io/$repo isn't public. On GitHub: your profile > Packages > $name > Package settings > Change visibility > Public." }
+    }
+}
+
+Write-Host '2/4 Resource group'
 az group create --name $ResourceGroup --location $Location --output none
 Assert-Az 'Creating the resource group'
-# Azure cannot update a stopped Postgres server, so wake it if a previous deploy exists.
-Start-PulseDeskDatabase $ResourceGroup
 
-Write-Host '2/5 Registry, database and environment (first run takes about 10 minutes)'
-$base = az deployment group create --resource-group $ResourceGroup --name pulsedesk-base --template-file $template `
-    --parameters deployApps=false --query properties.outputs --output json | ConvertFrom-Json
-Assert-Az 'Deploying the base infrastructure'
-$registry = $base.acrLoginServer.value
-
-Write-Host '3/5 Building and pushing images'
-$tag = Get-Date -Format 'yyyyMMddHHmm'
-# A just-created registry can take a minute to become visible to `az acr login`.
-foreach ($attempt in 1..6) {
-    Invoke-Quiet { az acr login --name $base.acrName.value } | Out-Null
-    if ($LASTEXITCODE -eq 0) { break }
-    Write-Host "  Registry not ready yet, retrying in 15 s ($attempt/6)"
-    Start-Sleep -Seconds 15
+# Postgres only applies the password when it first creates its data directory, so reuse the existing one.
+$dbPassword = Invoke-Quiet { az containerapp secret show --resource-group $ResourceGroup --name pulsedesk-db --secret-name db-password --query value --output tsv }
+if ($LASTEXITCODE -ne 0 -or -not "$dbPassword".Trim()) {
+    $dbPassword = 'Pd1' + [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N').Substring(0, 8)
 }
-Assert-Az 'Signing in to the container registry'
-$images = @{}
-foreach ($image in @(@{ Name = 'pulsedesk-api'; Dir = 'backend' }, @{ Name = 'pulsedesk-web'; Dir = 'frontend' })) {
-    $ref = "$registry/$($image.Name):$tag"
-    docker build --platform linux/amd64 --tag $ref (Join-Path $root $image.Dir)
-    Assert-Az "Building $($image.Name)"
-    docker push $ref
-    Assert-Az "Pushing $($image.Name)"
-    $images[$image.Name] = $ref
-}
+$dbPassword = "$dbPassword".Trim()
 
-Write-Host '4/5 Container apps and nightly auto-stop job'
+Write-Host '3/4 Infrastructure and apps (first run takes about 10 minutes)'
 # Keep a custom domain bound by custom-domain.ps1; leaving it out of the template would unbind it.
 $binding = Get-PulseDeskDomainBinding $ResourceGroup 'pulsedesk-web'
-$domainParams = @()
+$extra = @()
 if ($binding) {
     Write-Host "  Keeping custom domain $($binding.name)"
-    $domainParams = @("customDomain=$($binding.name)", "customDomainCertificateId=$($binding.cert)")
+    $extra = @("customDomain=$($binding.name)", "customDomainCertificateId=$($binding.cert)")
 }
-$out = az deployment group create --resource-group $ResourceGroup --name pulsedesk-apps --template-file $template `
-    --parameters deployApps=true "apiImage=$($images['pulsedesk-api'])" "webImage=$($images['pulsedesk-web'])" @domainParams `
-    --query properties.outputs --output json | ConvertFrom-Json
-Assert-Az 'Deploying the apps'
+# Pass the secret through a temporary parameters file so it never appears on a command line.
+$paramsFile = Join-Path ([IO.Path]::GetTempPath()) "pulsedesk-params-$([guid]::NewGuid().ToString('N')).json"
+@{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
+   contentVersion = '1.0.0.0'
+   parameters = @{ dbPassword = @{ value = $dbPassword } } } | ConvertTo-Json -Depth 5 | Set-Content -Path $paramsFile -Encoding utf8
+try {
+    $out = az deployment group create --resource-group $ResourceGroup --name pulsedesk --template-file $template `
+        --parameters "@$paramsFile" "apiImage=$($images['pulsedesk-api'])" "webImage=$($images['pulsedesk-web'])" @extra `
+        --query properties.outputs --output json | ConvertFrom-Json
+    Assert-Az 'Deploying'
+} finally {
+    Remove-Item $paramsFile -ErrorAction SilentlyContinue
+}
 # Apps stopped by demo-down or the nightly job stay stopped through an update, so start them explicitly.
 Invoke-PulseDeskAppAction $ResourceGroup 'start'
 
 $url = $out.webUrl.value
-Write-Host '5/5 Waiting for the backend to start'
-if (Wait-PulseDeskHealthy $url) {
+Write-Host '4/4 Waiting for the backend to start'
+if (Wait-PulseDeskHealthy $url 600) {
     Write-Host "`nPulseDesk is live at $url" -ForegroundColor Green
 } else {
     Write-Warning "Deployed, but $url/healthz is not UP yet. Check logs: az containerapp logs show -g $ResourceGroup -n pulsedesk-api --container api"

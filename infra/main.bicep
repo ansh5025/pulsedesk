@@ -1,32 +1,29 @@
-// PulseDesk on Azure Container Apps, sized for on-demand demos.
-// Deploy with scripts/azure/deploy.ps1 rather than by hand: it builds and pushes the images between two passes.
+// PulseDesk on Azure Container Apps, sized for on-demand demos: nothing but a tiny file share is billed while stopped.
+// Images come from GitHub Container Registry (published by CI); deploy with scripts/azure/deploy.ps1.
 
 @description('Azure region for every resource.')
 param location string = resourceGroup().location
 
 @description('Short prefix used in resource names.')
 @minLength(3)
-@maxLength(12)
+@maxLength(9)
 param prefix string = 'pulsedesk'
 
-@description('First pass creates the registry and database only; second pass adds the apps once images exist.')
-param deployApps bool = true
+@description('Public backend image, e.g. ghcr.io/ansh5025/pulsedesk-api:<commit sha>.')
+param apiImage string
 
-@description('Full image reference for the backend, e.g. myacr.azurecr.io/pulsedesk-api:202611251200.')
-param apiImage string = ''
-
-@description('Full image reference for the frontend.')
-param webImage string = ''
+@description('Public frontend image.')
+param webImage string
 
 @description('JWT signing secret. Regenerated on each deployment, which signs everyone out.')
 @secure()
 param jwtSecret string = '${newGuid()}${newGuid()}'
 
-@description('Postgres admin password. Regenerated on each deployment and passed to the backend in the same pass.')
+@description('Database password. Must stay the same across deploys: Postgres only applies it when the data directory is first created.')
 @secure()
-param pgPassword string = 'Pd1!${newGuid()}'
+param dbPassword string
 
-@description('UTC cron for the nightly safety stop of apps and database. Default is 01:00 IST.')
+@description('UTC cron for the nightly safety stop of all apps. Default is 01:00 IST.')
 param autoStopCron string = '30 19 * * *'
 
 @description('Custom domain for the frontend, e.g. pulsedesk.anshrai.in. Bind it first with scripts/azure/custom-domain.ps1.')
@@ -36,9 +33,10 @@ param customDomain string = ''
 param customDomainCertificateId string = ''
 
 var suffix = uniqueString(resourceGroup().id)
-var pgAdmin = 'pulsedeskadmin'
 var apiName = '${prefix}-api'
 var webName = '${prefix}-web'
+var dbName = '${prefix}-db'
+var dbUser = 'pulsedesk'
 var publicHost = empty(customDomain) ? '${webName}.${env.properties.defaultDomain}' : customDomain
 
 resource logs 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
@@ -50,59 +48,24 @@ resource logs 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   }
 }
 
-resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
-  name: '${prefix}${suffix}'
+// Holds the Postgres data directory, so data survives stops and restarts. Pay-per-GB-used: a few rupees a month.
+resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
+  name: '${prefix}st${suffix}'
   location: location
-  sku: { name: 'Basic' }
+  sku: { name: 'Standard_LRS' }
+  kind: 'StorageV2'
   properties: {
-    adminUserEnabled: true
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+    allowBlobPublicAccess: false
   }
 }
 
-resource pg 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
-  name: '${prefix}-pg-${suffix}'
-  location: location
-  sku: {
-    name: 'Standard_B1ms'
-    tier: 'Burstable'
-  }
+resource pgShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-05-01' = {
+  name: '${storage.name}/default/pgdata'
   properties: {
-    version: '16'
-    administratorLogin: pgAdmin
-    administratorLoginPassword: pgPassword
-    storage: {
-      storageSizeGB: 32
-      autoGrow: 'Disabled'
-    }
-    backup: {
-      backupRetentionDays: 7
-      geoRedundantBackup: 'Disabled'
-    }
-    highAvailability: { mode: 'Disabled' }
-    network: { publicNetworkAccess: 'Enabled' }
-    authConfig: {
-      activeDirectoryAuth: 'Disabled'
-      passwordAuth: 'Enabled'
-    }
-  }
-}
-
-resource pgDatabase 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2024-08-01' = {
-  parent: pg
-  name: 'pulsedesk'
-  properties: {
-    charset: 'UTF8'
-    collation: 'en_US.utf8'
-  }
-}
-
-// 0.0.0.0 is Azure's marker for "allow connections from Azure services"; there is no public internet rule.
-resource pgAllowAzure 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2024-08-01' = {
-  parent: pg
-  name: 'AllowAzureServices'
-  properties: {
-    startIpAddress: '0.0.0.0'
-    endIpAddress: '0.0.0.0'
+    shareQuota: 5
+    accessTier: 'TransactionOptimized'
   }
 }
 
@@ -129,20 +92,88 @@ resource env 'Microsoft.App/managedEnvironments@2026-07-01' = {
   }
 }
 
-var registry = [
-  {
-    server: acr.properties.loginServer
-    username: acr.listCredentials().username
-    passwordSecretRef: 'acr-password'
+resource envStorage 'Microsoft.App/managedEnvironments/storages@2026-07-01' = {
+  parent: env
+  name: 'pgdata'
+  dependsOn: [pgShare]
+  properties: {
+    azureFile: {
+      accountName: storage.name
+      accountKey: storage.listKeys().keys[0].value
+      shareName: 'pgdata'
+      accessMode: 'ReadWrite'
+    }
   }
-]
+}
 
-resource api 'Microsoft.App/containerApps@2024-03-01' = if (deployApps) {
+// Postgres 16 with its data on the file share. Internal TCP only: reachable from the API as pulsedesk-db:5432.
+resource db 'Microsoft.App/containerApps@2026-07-01' = {
+  name: dbName
+  location: location
+  properties: {
+    environmentId: env.id
+    workloadProfileName: 'Consumption'
+    configuration: {
+      activeRevisionsMode: 'Single'
+      ingress: {
+        external: false
+        transport: 'tcp'
+        targetPort: 5432
+        exposedPort: 5432
+      }
+      secrets: [
+        { name: 'db-password', value: dbPassword }
+      ]
+    }
+    template: {
+      // Postgres shuts down on SIGINT (the image's stop signal); allow time to checkpoint to the share.
+      terminationGracePeriodSeconds: 60
+      containers: [
+        {
+          name: 'postgres'
+          image: 'docker.io/library/postgres:16-alpine'
+          resources: { cpu: json('0.25'), memory: '0.5Gi' }
+          env: [
+            { name: 'POSTGRES_DB', value: 'pulsedesk' }
+            { name: 'POSTGRES_USER', value: dbUser }
+            { name: 'POSTGRES_PASSWORD', secretRef: 'db-password' }
+            { name: 'PGDATA', value: '/var/lib/postgresql/data/pgdata' }
+          ]
+          volumeMounts: [
+            { volumeName: 'pgdata', mountPath: '/var/lib/postgresql/data' }
+          ]
+          probes: [
+            {
+              type: 'Startup'
+              tcpSocket: { port: 5432 }
+              periodSeconds: 5
+              failureThreshold: 60
+            }
+          ]
+        }
+      ]
+      volumes: [
+        {
+          name: 'pgdata'
+          storageType: 'AzureFile'
+          storageName: envStorage.name
+          // SMB has no Unix ownership: present everything as the image's postgres user (uid 70) with the
+          // 0700/0600 modes Postgres insists on; nobrl avoids byte-range lock errors on the share.
+          mountOptions: 'uid=70,gid=70,dir_mode=0700,file_mode=0600,nobrl,mfsymlinks,cache=strict'
+        }
+      ]
+      // One writer only: two Postgres processes must never share a data directory.
+      scale: { minReplicas: 1, maxReplicas: 1 }
+    }
+  }
+}
+
+resource api 'Microsoft.App/containerApps@2026-07-01' = {
   name: apiName
   location: location
-  dependsOn: [pgDatabase, pgAllowAzure]
   properties: {
-    managedEnvironmentId: env.id
+    environmentId: env.id
+    workloadProfileName: 'Consumption'
     configuration: {
       activeRevisionsMode: 'Single'
       // Internal only: the browser reaches the API through the frontend's /api proxy.
@@ -152,11 +183,9 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = if (deployApps) {
         transport: 'http'
         allowInsecure: true
       }
-      registries: registry
       secrets: [
-        { name: 'acr-password', value: acr.listCredentials().passwords[0].value }
         { name: 'jwt-secret', value: jwtSecret }
-        { name: 'db-password', value: pgPassword }
+        { name: 'db-password', value: dbPassword }
       ]
     }
     template: {
@@ -166,8 +195,8 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = if (deployApps) {
           image: apiImage
           resources: { cpu: json('0.5'), memory: '1Gi' }
           env: [
-            { name: 'PULSEDESK_DB_URL', value: 'jdbc:postgresql://${pg.properties.fullyQualifiedDomainName}:5432/pulsedesk?sslmode=require' }
-            { name: 'PULSEDESK_DB_USER', value: pgAdmin }
+            { name: 'PULSEDESK_DB_URL', value: 'jdbc:postgresql://${dbName}:5432/pulsedesk' }
+            { name: 'PULSEDESK_DB_USER', value: dbUser }
             { name: 'PULSEDESK_DB_PASSWORD', secretRef: 'db-password' }
             { name: 'PULSEDESK_JWT_SECRET', secretRef: 'jwt-secret' }
             { name: 'PULSEDESK_REDIS_HOST', value: 'localhost' }
@@ -178,11 +207,12 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = if (deployApps) {
           ]
           probes: [
             {
+              // Generous: the database may still be starting when the API starts.
               type: 'Startup'
               httpGet: { path: '/actuator/health', port: 8080 }
               initialDelaySeconds: 20
               periodSeconds: 10
-              failureThreshold: 10
+              failureThreshold: 18
             }
             {
               type: 'Liveness'
@@ -205,11 +235,12 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = if (deployApps) {
   }
 }
 
-resource web 'Microsoft.App/containerApps@2024-03-01' = if (deployApps) {
+resource web 'Microsoft.App/containerApps@2026-07-01' = {
   name: webName
   location: location
   properties: {
-    managedEnvironmentId: env.id
+    environmentId: env.id
+    workloadProfileName: 'Consumption'
     configuration: {
       activeRevisionsMode: 'Single'
       ingress: {
@@ -226,10 +257,6 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = if (deployApps) {
           }
         ]
       }
-      registries: registry
-      secrets: [
-        { name: 'acr-password', value: acr.listCredentials().passwords[0].value }
-      ]
     }
     template: {
       containers: [
@@ -247,14 +274,15 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = if (deployApps) {
   }
 }
 
-// Nightly safety net: stops both apps and the database in case a demo was left running,
-// and catches Azure's automatic restart of a Postgres server that has been stopped for 7 days.
-resource autoStop 'Microsoft.App/jobs@2024-03-01' = if (deployApps) {
+// Nightly safety net: stops every app in case a demo was left running. The database goes last so it can
+// shut down cleanly after the API has disconnected.
+resource autoStop 'Microsoft.App/jobs@2026-07-01' = {
   name: '${prefix}-autostop'
   location: location
   identity: { type: 'SystemAssigned' }
   properties: {
     environmentId: env.id
+    workloadProfileName: 'Consumption'
     configuration: {
       triggerType: 'Schedule'
       replicaTimeout: 900
@@ -273,13 +301,13 @@ resource autoStop 'Microsoft.App/jobs@2024-03-01' = if (deployApps) {
           resources: { cpu: json('0.25'), memory: '0.5Gi' }
           command: ['/bin/bash', '-c']
           args: [
-            'az login --identity --output none && v=$(az provider show -n Microsoft.App --query "resourceTypes[?resourceType==\'containerApps\'].apiVersions[0]" -o tsv) && for id in "$API_ID" "$WEB_ID"; do az rest --method post --url "\${ARM_URL%/}$id/stop?api-version=$v" || true; done; az postgres flexible-server stop --ids "$PG_ID" || true'
+            'az login --identity --output none && v=$(az provider show -n Microsoft.App --query "resourceTypes[?resourceType==\'containerApps\'].apiVersions[0]" -o tsv) && for id in "$WEB_ID" "$API_ID" "$DB_ID"; do az rest --method post --url "\${ARM_URL%/}$id/stop?api-version=$v" || true; done'
           ]
           env: [
             { name: 'ARM_URL', value: environment().resourceManager }
-            { name: 'API_ID', value: api.id }
             { name: 'WEB_ID', value: web.id }
-            { name: 'PG_ID', value: pg.id }
+            { name: 'API_ID', value: api.id }
+            { name: 'DB_ID', value: db.id }
           ]
         }
       ]
@@ -289,18 +317,13 @@ resource autoStop 'Microsoft.App/jobs@2024-03-01' = if (deployApps) {
 
 var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 
-resource autoStopRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployApps) {
+resource autoStopRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(resourceGroup().id, '${prefix}-autostop', contributorRoleId)
   properties: {
-    principalId: autoStop!.identity.principalId
+    principalId: autoStop.identity.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', contributorRoleId)
   }
 }
 
-output acrName string = acr.name
-output acrLoginServer string = acr.properties.loginServer
-output postgresName string = pg.name
-output apiName string = apiName
-output webName string = webName
-output webUrl string = deployApps ? 'https://${empty(customDomainCertificateId) ? web!.properties.configuration.ingress.fqdn : customDomain}' : ''
+output webUrl string = 'https://${empty(customDomainCertificateId) ? web.properties.configuration.ingress.fqdn : customDomain}'
