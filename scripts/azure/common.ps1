@@ -59,6 +59,22 @@ function Test-PublicImage([string]$Repository, [string]$Tag) {
     }
 }
 
+# After an update the old revision keeps serving until the new one is ready, so a health check alone can
+# pass against the old version. Wait until each app's newest revision is the one that's ready.
+function Wait-PulseDeskRevisions([string]$ResourceGroup, [int]$TimeoutSeconds = 600) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    foreach ($app in Get-PulseDeskApps $ResourceGroup) {
+        Write-Host "  Waiting for the new revision of $($app.name)..."
+        while ($true) {
+            $state = (az containerapp show --resource-group $ResourceGroup --name $app.name `
+                --query "{latest:properties.latestRevisionName, ready:properties.latestReadyRevisionName}" --output json | Out-String) | ConvertFrom-Json
+            if ($state.latest -and $state.latest -eq $state.ready) { break }
+            if ((Get-Date) -gt $deadline) { throw "$($app.name) revision $($state.latest) didn't become ready. Check its logs." }
+            Start-Sleep -Seconds 10
+        }
+    }
+}
+
 function Wait-PulseDeskHealthy([string]$WebUrl, [int]$TimeoutSeconds = 420) {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     Write-Host "  Waiting for $WebUrl to report healthy..."

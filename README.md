@@ -1,4 +1,4 @@
-# PulseDesk
+﻿# PulseDesk
 
 [![CI](https://github.com/ansh5025/pulsedesk/actions/workflows/ci.yml/badge.svg)](https://github.com/ansh5025/pulsedesk/actions/workflows/ci.yml)
 
@@ -6,7 +6,7 @@ Multi-tenant incident, SLA and service-health platform. It watches your services
 
 **Live demo:** https://pulsedesk.anshrai.in. It runs on demand, so it may be stopped. Sign in with organization `demo`, password `Demo@12345`.
 
-**Stack:** Java 21 · Spring Boot 3.3 · PostgreSQL · Redis · RabbitMQ · React 18 + TypeScript · Docker · Azure Container Apps (Bicep) · GitHub Actions
+**Stack:** Java 21 Â· Spring Boot 3.3 Â· PostgreSQL Â· Redis Â· RabbitMQ Â· React 18 + TypeScript Â· Docker Â· Azure Container Apps (Bicep) Â· GitHub Actions
 
 ## Features
 
@@ -116,7 +116,7 @@ git push                                          # then wait for CI's "Docker i
 .\scripts\azure\demo-down.ps1                     # afterwards
 ```
 
-- The GitHub packages `pulsedesk-api` and `pulsedesk-web` must be public (Package settings > Change visibility) so Azure can pull them without credentials.
+- Azure pulls the GitHub packages `pulsedesk-api` and `pulsedesk-web` without credentials, so they must stay public (they inherit the public repo's visibility).
 - Re-run `deploy.ps1` to ship new code. It regenerates the JWT secret, so everyone signs in again; the database and its password are kept.
 - Email is off in Azure (`PULSEDESK_MESSAGING_ENABLED=false`); there's no RabbitMQ there.
 - The database has no backups. If its data is lost, `seed-demo.ps1` recreates the demo org.

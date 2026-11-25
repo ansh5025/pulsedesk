@@ -110,3 +110,9 @@ JwtAuthenticationFilter, custom principal, global @RestControllerAdvice, registr
 - Deployed 2026-11-25 to rg pulsedesk-rg, Japan East (student sub f3347f53...; tenant needs MFA: az login --tenant 7d76ad6e-...). Live: https://pulsedesk.anshrai.in (GoDaddy DNS: CNAME pulsedesk + TXT asuid.pulsedesk; asuid value is per-subscription, shared with ecommerce-api).
 - Lessons: student subs get SkuNotAvailable for Postgres B1ms in Central India/SE Asia/Korea Central; new subs default Container Apps env to Express (no sidecars) so env pinned to WorkloadProfiles; nginx needs proxy_http_version 1.1 (ACA ingress 426s HTTP/1.0); multi-container app updates need --container-name.
 - Credit ~INR 1,848 at deploy time. Stop with demo-down.ps1; nightly job stops at 01:00 IST.
+
+## Phase 11 - Idle cost cut
+- Images: CI publishes ghcr.io/ansh5025/pulsedesk-{api,web}:<sha>|latest after tests on main (public, inherited from repo). deploy.ps1 deploys the current HEAD's images; no ACR, no local Docker.
+- Database: managed Postgres (32 GB min) replaced by Container App pulsedesk-db (postgres:16-alpine, internal TCP 5432, 1 replica) with PGDATA on Azure Files share 'pgdata' (mount uid/gid 70, 0700/0600, nobrl). No backups; seed-demo.ps1 recreates demo. Password reused from the db app secret on redeploy.
+- Start order db->api->web, stop reverse (demo scripts and nightly job). demo-up ~1 min. deploy.ps1 waits for latestRevision==latestReadyRevision (old revision otherwise answers health checks).
+- Idle cost now ~INR 10-20/month (file share + logs). Old managed PG and ACR deleted 2026-11-26.

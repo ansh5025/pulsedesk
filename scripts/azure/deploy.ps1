@@ -66,7 +66,8 @@ try {
 Invoke-PulseDeskAppAction $ResourceGroup 'start'
 
 $url = $out.webUrl.value
-Write-Host '4/4 Waiting for the backend to start'
+Write-Host '4/4 Waiting for the new version to take over'
+Wait-PulseDeskRevisions $ResourceGroup
 if (Wait-PulseDeskHealthy $url 600) {
     Write-Host "`nPulseDesk is live at $url" -ForegroundColor Green
 } else {
