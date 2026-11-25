@@ -18,6 +18,8 @@
     <properties>
         <java.version>21</java.version>
         <jjwt.version>0.12.6</jjwt.version>
+        <!-- 1.21.4+ speaks a Docker API version accepted by Docker 29 (GitHub runners); older 1.x is rejected. -->
+        <testcontainers.version>1.21.4</testcontainers.version>
     </properties>
 
     <dependencies>
