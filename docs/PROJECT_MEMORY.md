@@ -99,3 +99,9 @@ JwtAuthenticationFilter, custom principal, global @RestControllerAdvice, registr
 - scripts/azure: deploy.ps1 (two-pass: base -> docker build/push -> apps), demo-up.ps1, demo-down.ps1, common.ps1. Container app start/stop via az rest (no CLI command).
 - SERVER_FORWARD_HEADERS_STRATEGY=native so login rate limit sees real client IP behind proxies.
 - docker-compose.app.yml runs both images locally on :8081 (verified end-to-end). Not yet deployed to Azure: user must az login.
+
+## Phase 9 - GitHub + custom domain
+- Public repo https://github.com/ansh5025/pulsedesk (homepage https://pulsedesk.anshrai.in). CI (.github/workflows/ci.yml): backend mvn test (Testcontainers), frontend build, docker image builds; all green.
+- Testcontainers pinned to 1.21.4 via testcontainers.version: Boot 3.3's 1.19 requests Docker API 1.32, rejected by Docker 29 on GitHub runners.
+- scripts/azure/custom-domain.ps1 binds pulsedesk.anshrai.in (CNAME pulsedesk -> web fqdn, TXT asuid.pulsedesk -> verification id) with a free managed cert and updates PULSEDESK_INVITE_URL. deploy.ps1 re-passes existing binding (customDomain/customDomainCertificateId params) so redeploys keep it.
+- Azure not deployed yet: user must az login and run deploy.ps1, then custom-domain.ps1.
