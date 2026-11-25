@@ -46,7 +46,8 @@ function Stop-PulseDeskDatabase([string]$ResourceGroup) {
 function Get-PulseDeskApps([string]$ResourceGroup) {
     $json = az containerapp list --resource-group $ResourceGroup --query "[].{id:id, name:name, fqdn:properties.configuration.ingress.fqdn, external:properties.configuration.ingress.external}" --output json
     Assert-Az 'Listing the container apps'
-    return @($json | ConvertFrom-Json)
+    # Windows PowerShell 5.1 emits a JSON array as one object; ForEach-Object unrolls it into items.
+    return @(($json | Out-String) | ConvertFrom-Json | ForEach-Object { $_ })
 }
 
 # The CLI has no start/stop for container apps, so call the management API directly.

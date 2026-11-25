@@ -106,10 +106,19 @@ resource pgAllowAzure 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2
   }
 }
 
-resource env 'Microsoft.App/managedEnvironments@2024-03-01' = {
+// Newer subscriptions default to the 'Express' mode, which rejects sidecar containers (the API's Redis sidecar),
+// so pin the workload-profiles mode with the standard serverless Consumption profile. Billing is the same.
+resource env 'Microsoft.App/managedEnvironments@2026-07-01' = {
   name: '${prefix}-env'
   location: location
   properties: {
+    environmentMode: 'WorkloadProfiles'
+    workloadProfiles: [
+      {
+        name: 'Consumption'
+        workloadProfileType: 'Consumption'
+      }
+    ]
     appLogsConfiguration: {
       destination: 'log-analytics'
       logAnalyticsConfiguration: {

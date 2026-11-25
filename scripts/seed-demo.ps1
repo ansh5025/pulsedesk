@@ -81,6 +81,7 @@ else {
 }
 
 Write-Host ""
-Write-Host "Demo org ready. Sign in at http://localhost:3000 with organisation '$Slug' and password '$Password'."
+$site = if ($Base -match 'localhost:8080') { 'http://localhost:3000' } else { $Base -replace '/api/v1/?$', '' }
+Write-Host "Demo org ready. Sign in at $site with organisation '$Slug' and password '$Password'."
 $login = Call GET "/organizations/current/members" $admin
 $login | ForEach-Object { "{0,-18} {1,-10} username: {2}" -f $_.fullName, $_.role, $_.username }

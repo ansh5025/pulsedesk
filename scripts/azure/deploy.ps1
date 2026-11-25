@@ -1,9 +1,12 @@
 # Creates or updates PulseDesk on Azure: infrastructure, images and apps.
-# Usage: az login; .\scripts\azure\deploy.ps1 [-ResourceGroup pulsedesk-rg] [-Location centralindia]
+# Usage: az login; .\scripts\azure\deploy.ps1 [-ResourceGroup pulsedesk-rg] [-Location japaneast]
 # Re-running is safe; it builds fresh images. Each run regenerates the JWT secret, so users sign in again.
+# Japan East is the default because Azure for Students subscriptions get SkuNotAvailable for the B1ms
+# database in several closer regions (tested: Central India, Southeast Asia, Korea Central; South India,
+# East US and West Europe are blocked outright). Pick another region with -Location if yours allows it.
 param(
     [string]$ResourceGroup = 'pulsedesk-rg',
-    [string]$Location = 'centralindia'
+    [string]$Location = 'japaneast'
 )
 . "$PSScriptRoot\common.ps1"
 $root = (Resolve-Path "$PSScriptRoot\..\..").Path
@@ -27,7 +30,13 @@ $registry = $base.acrLoginServer.value
 
 Write-Host '3/5 Building and pushing images'
 $tag = Get-Date -Format 'yyyyMMddHHmm'
-az acr login --name $base.acrName.value
+# A just-created registry can take a minute to become visible to `az acr login`.
+foreach ($attempt in 1..6) {
+    Invoke-Quiet { az acr login --name $base.acrName.value } | Out-Null
+    if ($LASTEXITCODE -eq 0) { break }
+    Write-Host "  Registry not ready yet, retrying in 15 s ($attempt/6)"
+    Start-Sleep -Seconds 15
+}
 Assert-Az 'Signing in to the container registry'
 $images = @{}
 foreach ($image in @(@{ Name = 'pulsedesk-api'; Dir = 'backend' }, @{ Name = 'pulsedesk-web'; Dir = 'frontend' })) {
