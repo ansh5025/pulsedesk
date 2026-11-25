@@ -27,6 +27,7 @@ function Get-PulseDeskApps([string]$ResourceGroup) {
 
 # The CLI has no start/stop for container apps, so call the management API directly.
 # Start the database first and stop it last, so the API never loses it mid-request and Postgres shuts down cleanly.
+# 'stop' leaves the site alone: it scales to zero by itself, and stopping it would turn off wake-on-visit.
 function Invoke-PulseDeskAppAction([string]$ResourceGroup, [ValidateSet('start', 'stop')][string]$Action) {
     $arm = (az cloud show --query endpoints.resourceManager --output tsv).TrimEnd('/')
     $version = az provider show --namespace Microsoft.App --query "resourceTypes[?resourceType=='containerApps'].apiVersions[0]" --output tsv
@@ -34,9 +35,25 @@ function Invoke-PulseDeskAppAction([string]$ResourceGroup, [ValidateSet('start',
     $order = @{ 'pulsedesk-db' = 0; 'pulsedesk-api' = 1; 'pulsedesk-web' = 2 }
     $apps = Get-PulseDeskApps $ResourceGroup | Sort-Object { if ($order.ContainsKey($_.name)) { $order[$_.name] } else { 1 } } -Descending:($Action -eq 'stop')
     foreach ($app in $apps) {
+        if ($Action -eq 'stop' -and $app.external) { continue }
         Write-Host "  $Action $($app.name)"
         az rest --method post --url "$arm$($app.id)/$($Action)?api-version=$version" --output none
         Assert-Az "$Action $($app.name)"
+    }
+}
+
+# Tells the site's waker to keep the API and database running for $Minutes (0 releases it), ignoring the idle stop
+# and the daily visitor limit. Returns $false if the waker isn't reachable yet (e.g. a revision still starting).
+function Set-PulseDeskHold([string]$ResourceGroup, [int]$Minutes, [switch]$Quiet) {
+    $key = Invoke-Quiet { az containerapp secret show --resource-group $ResourceGroup --name pulsedesk-web --secret-name waker-key --query value --output tsv }
+    if ($LASTEXITCODE -ne 0 -or -not "$key".Trim()) { return $false }
+    try {
+        $url = Get-PulseDeskWebUrl $ResourceGroup
+        Invoke-RestMethod -Method Post -Uri "$url/waker/hold?minutes=$Minutes" -Headers @{ 'X-Waker-Key' = "$key".Trim() } -TimeoutSec 60 | Out-Null
+        return $true
+    } catch {
+        if (-not $Quiet) { Write-Warning "Couldn't reach the waker: $($_.Exception.Message)" }
+        return $false
     }
 }
 
@@ -61,11 +78,12 @@ function Test-PublicImage([string]$Repository, [string]$Tag) {
 
 # After an update the old revision keeps serving until the new one is ready, so a health check alone can
 # pass against the old version. Wait until each app's newest revision is the one that's ready.
-function Wait-PulseDeskRevisions([string]$ResourceGroup, [int]$TimeoutSeconds = 600) {
+function Wait-PulseDeskRevisions([string]$ResourceGroup, [int]$TimeoutSeconds = 600, [scriptblock]$OnPoll) {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     foreach ($app in Get-PulseDeskApps $ResourceGroup) {
         Write-Host "  Waiting for the new revision of $($app.name)..."
         while ($true) {
+            if ($OnPoll) { & $OnPoll }
             $state = (az containerapp show --resource-group $ResourceGroup --name $app.name `
                 --query "{latest:properties.latestRevisionName, ready:properties.latestReadyRevisionName}" --output json | Out-String) | ConvertFrom-Json
             if ($state.latest -and $state.latest -eq $state.ready) { break }

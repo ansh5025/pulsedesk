@@ -116,3 +116,10 @@ JwtAuthenticationFilter, custom principal, global @RestControllerAdvice, registr
 - Database: managed Postgres (32 GB min) replaced by Container App pulsedesk-db (postgres:16-alpine, internal TCP 5432, 1 replica) with PGDATA on Azure Files share 'pgdata' (mount uid/gid 70, 0700/0600, nobrl). No backups; seed-demo.ps1 recreates demo. Password reused from the db app secret on redeploy.
 - Start order db->api->web, stop reverse (demo scripts and nightly job). demo-up ~1 min. deploy.ps1 waits for latestRevision==latestReadyRevision (old revision otherwise answers health checks).
 - Idle cost now ~INR 10-20/month (file share + logs). Old managed PG and ACR deleted 2026-11-26.
+
+## Phase 12 - Wake on visit
+- pulsedesk-web scales to zero (cooldown 600 s) with a 'waker' sidecar (same web image + nodejs, `node /opt/waker/server.mjs`, frontend/waker). nginx proxies /waker/ to 127.0.0.1:8081.
+- Page (src/Wake.tsx) POSTs /waker/start every 3 s until ready (shows step db/API, ETA from avg of last 5 cold starts), then GETs /waker/status every 60 s as heartbeat. No waker (local) -> 3 failed tries -> app renders normally.
+- Waker: web app system identity, Contributor scoped to pulsedesk-api and pulsedesk-db only; ARM start/stop (api-version 2025-01-01). Stops API then DB after IDLE_MINUTES (3) without heartbeat. Daily visitor cap DAILY_CAP_MINUTES (60, IST day) -> 'capped' screen. While API/DB run it pings PUBLIC_URL/waker/ping every 30 s so the web replica stays alive to stop them.
+- State (usedSeconds, holdUntil, start history) in Azure Files share 'waker' (/state/waker.json). Admin hold: POST /waker/hold?minutes=N with X-Waker-Key (secret waker-key, reused by deploy.ps1); demo-up holds 120 min, demo-down releases, deploy holds 20 min. Holds bypass idle stop and cap.
+- Stop actions (demo-down, nightly job) no longer stop pulsedesk-web.

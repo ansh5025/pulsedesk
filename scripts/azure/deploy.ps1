@@ -40,6 +40,10 @@ if ($LASTEXITCODE -ne 0 -or -not "$dbPassword".Trim()) {
     $dbPassword = 'Pd1' + [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N').Substring(0, 8)
 }
 $dbPassword = "$dbPassword".Trim()
+# Same for the waker's admin key, so demo-up.ps1 keeps working across deploys.
+$wakerKey = Invoke-Quiet { az containerapp secret show --resource-group $ResourceGroup --name pulsedesk-web --secret-name waker-key --query value --output tsv }
+if ($LASTEXITCODE -ne 0 -or -not "$wakerKey".Trim()) { $wakerKey = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N') }
+$wakerKey = "$wakerKey".Trim()
 
 Write-Host '3/4 Infrastructure and apps (first run takes about 10 minutes)'
 # Keep a custom domain bound by custom-domain.ps1; leaving it out of the template would unbind it.
@@ -53,7 +57,7 @@ if ($binding) {
 $paramsFile = Join-Path ([IO.Path]::GetTempPath()) "pulsedesk-params-$([guid]::NewGuid().ToString('N')).json"
 @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
    contentVersion = '1.0.0.0'
-   parameters = @{ dbPassword = @{ value = $dbPassword } } } | ConvertTo-Json -Depth 5 | Set-Content -Path $paramsFile -Encoding utf8
+   parameters = @{ dbPassword = @{ value = $dbPassword }; wakerKey = @{ value = $wakerKey } } } | ConvertTo-Json -Depth 5 | Set-Content -Path $paramsFile -Encoding utf8
 try {
     $out = az deployment group create --resource-group $ResourceGroup --name pulsedesk --template-file $template `
         --parameters "@$paramsFile" "apiImage=$($images['pulsedesk-api'])" "webImage=$($images['pulsedesk-web'])" @extra `
@@ -67,11 +71,16 @@ Invoke-PulseDeskAppAction $ResourceGroup 'start'
 
 $url = $out.webUrl.value
 Write-Host '4/4 Waiting for the new version to take over'
-Wait-PulseDeskRevisions $ResourceGroup
+# Hold the API awake so the new site's waker doesn't put it to sleep mid-deploy; retried until the waker answers.
+$script:held = $false
+$holdOnce = { if (-not $script:held) { $script:held = Set-PulseDeskHold $ResourceGroup 20 -Quiet } }
+Wait-PulseDeskRevisions $ResourceGroup -OnPoll $holdOnce
+& $holdOnce
 if (Wait-PulseDeskHealthy $url 600) {
     Write-Host "`nPulseDesk is live at $url" -ForegroundColor Green
+    Write-Host 'It stays up for 20 minutes, then sleeps 3 minutes after the last visitor leaves. Visits wake it again.'
 } else {
     Write-Warning "Deployed, but $url/healthz is not UP yet. Check logs: az containerapp logs show -g $ResourceGroup -n pulsedesk-api --container api"
 }
 Write-Host "First time only, load the demo data:  .\scripts\seed-demo.ps1 -Base $url/api/v1"
-Write-Host "Stop everything when you're done:     .\scripts\azure\demo-down.ps1"
+Write-Host "Before an interview, keep it awake:   .\scripts\azure\demo-up.ps1"

@@ -23,8 +23,18 @@ param jwtSecret string = '${newGuid()}${newGuid()}'
 @secure()
 param dbPassword string
 
-@description('UTC cron for the nightly safety stop of all apps. Default is 01:00 IST.')
+@description('UTC cron for the nightly safety stop of the API and database. Default is 01:00 IST.')
 param autoStopCron string = '30 19 * * *'
+
+@description('Admin key for the waker\'s hold endpoint, used by demo-up.ps1. Kept across deploys by deploy.ps1.')
+@secure()
+param wakerKey string
+
+@description('Stop the API and database after this many minutes with no open browser tab.')
+param wakeIdleMinutes int = 3
+
+@description('Daily limit on visitor-started running time, in minutes (0 = no limit). Holds from demo-up.ps1 don\'t count.')
+param wakeDailyCapMinutes int = 60
 
 @description('Custom domain for the frontend, e.g. pulsedesk.anshrai.in. Bind it first with scripts/azure/custom-domain.ps1.')
 param customDomain string = ''
@@ -69,6 +79,15 @@ resource pgShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-05-
   }
 }
 
+// The waker's daily usage counter and admin hold, so they survive the site scaling to zero.
+resource wakerShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-05-01' = {
+  name: '${storage.name}/default/waker'
+  properties: {
+    shareQuota: 1
+    accessTier: 'TransactionOptimized'
+  }
+}
+
 // Newer subscriptions default to the 'Express' mode, which rejects sidecar containers (the API's Redis sidecar),
 // so pin the workload-profiles mode with the standard serverless Consumption profile. Billing is the same.
 resource env 'Microsoft.App/managedEnvironments@2026-07-01' = {
@@ -101,6 +120,20 @@ resource envStorage 'Microsoft.App/managedEnvironments/storages@2026-07-01' = {
       accountName: storage.name
       accountKey: storage.listKeys().keys[0].value
       shareName: 'pgdata'
+      accessMode: 'ReadWrite'
+    }
+  }
+}
+
+resource wakerStorage 'Microsoft.App/managedEnvironments/storages@2026-07-01' = {
+  parent: env
+  name: 'waker'
+  dependsOn: [wakerShare]
+  properties: {
+    azureFile: {
+      accountName: storage.name
+      accountKey: storage.listKeys().keys[0].value
+      shareName: 'waker'
       accessMode: 'ReadWrite'
     }
   }
@@ -235,9 +268,12 @@ resource api 'Microsoft.App/containerApps@2026-07-01' = {
   }
 }
 
+// The site scales to zero when nobody visits. Its waker sidecar starts the database and API on a visit and
+// stops them once every tab has been closed for wakeIdleMinutes (see frontend/waker/server.mjs).
 resource web 'Microsoft.App/containerApps@2026-07-01' = {
   name: webName
   location: location
+  identity: { type: 'SystemAssigned' }
   properties: {
     environmentId: env.id
     workloadProfileName: 'Consumption'
@@ -257,6 +293,9 @@ resource web 'Microsoft.App/containerApps@2026-07-01' = {
           }
         ]
       }
+      secrets: [
+        { name: 'waker-key', value: wakerKey }
+      ]
     }
     template: {
       containers: [
@@ -268,14 +307,77 @@ resource web 'Microsoft.App/containerApps@2026-07-01' = {
             { name: 'BACKEND_URL', value: 'http://${apiName}' }
           ]
         }
+        {
+          name: 'waker'
+          image: webImage
+          command: ['node', '/opt/waker/server.mjs']
+          resources: { cpu: json('0.25'), memory: '0.5Gi' }
+          env: [
+            { name: 'ARM_URL', value: environment().resourceManager }
+            { name: 'DB_ID', value: db.id }
+            { name: 'API_ID', value: api.id }
+            { name: 'DB_HOST', value: dbName }
+            { name: 'API_HEALTH_URL', value: 'http://${apiName}/actuator/health' }
+            { name: 'PUBLIC_URL', value: 'https://${publicHost}' }
+            { name: 'IDLE_MINUTES', value: string(wakeIdleMinutes) }
+            { name: 'DAILY_CAP_MINUTES', value: string(wakeDailyCapMinutes) }
+            { name: 'TZ_OFFSET_MINUTES', value: '330' }
+            { name: 'STATE_FILE', value: '/state/waker.json' }
+            { name: 'WAKER_KEY', secretRef: 'waker-key' }
+          ]
+          volumeMounts: [
+            { volumeName: 'waker', mountPath: '/state' }
+          ]
+        }
       ]
-      scale: { minReplicas: 1, maxReplicas: 1 }
+      volumes: [
+        {
+          name: 'waker'
+          storageType: 'AzureFile'
+          storageName: wakerStorage.name
+          mountOptions: 'nobrl'
+        }
+      ]
+      // The cooldown must outlast the waker's idle timer, so the waker is still around to stop the API.
+      // While the API runs, the waker also pings the site to keep this replica alive.
+      scale: {
+        minReplicas: 0
+        maxReplicas: 1
+        cooldownPeriod: 600
+        rules: [
+          {
+            name: 'http'
+            http: { metadata: { concurrentRequests: '50' } }
+          }
+        ]
+      }
     }
   }
 }
 
-// Nightly safety net: stops every app in case a demo was left running. The database goes last so it can
-// shut down cleanly after the API has disconnected.
+// Lets the waker start and stop just the API and database.
+resource wakerApiRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(api.id, webName, contributorRoleId)
+  scope: api
+  properties: {
+    principalId: web.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', contributorRoleId)
+  }
+}
+
+resource wakerDbRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(db.id, webName, contributorRoleId)
+  scope: db
+  properties: {
+    principalId: web.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', contributorRoleId)
+  }
+}
+
+// Nightly safety net: stops the API and database in case a demo was left running (the site sleeps by itself).
+// The database goes last so it can shut down cleanly after the API has disconnected.
 resource autoStop 'Microsoft.App/jobs@2026-07-01' = {
   name: '${prefix}-autostop'
   location: location
@@ -301,11 +403,10 @@ resource autoStop 'Microsoft.App/jobs@2026-07-01' = {
           resources: { cpu: json('0.25'), memory: '0.5Gi' }
           command: ['/bin/bash', '-c']
           args: [
-            'az login --identity --output none && v=$(az provider show -n Microsoft.App --query "resourceTypes[?resourceType==\'containerApps\'].apiVersions[0]" -o tsv) && for id in "$WEB_ID" "$API_ID" "$DB_ID"; do az rest --method post --url "\${ARM_URL%/}$id/stop?api-version=$v" || true; done'
+            'az login --identity --output none && v=$(az provider show -n Microsoft.App --query "resourceTypes[?resourceType==\'containerApps\'].apiVersions[0]" -o tsv) && for id in "$API_ID" "$DB_ID"; do az rest --method post --url "\${ARM_URL%/}$id/stop?api-version=$v" || true; done'
           ]
           env: [
             { name: 'ARM_URL', value: environment().resourceManager }
-            { name: 'WEB_ID', value: web.id }
             { name: 'API_ID', value: api.id }
             { name: 'DB_ID', value: db.id }
           ]

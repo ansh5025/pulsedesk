@@ -92,19 +92,22 @@ Invitation links look like `http://localhost:3000/accept-invite?token=...`, whic
 `GET /organizations/current/members` is readable by every member so names show instead of ids.
 If a team lead or developer signs in but workspace loading returns 403, restart the backend to load the current directory permissions, then click Retry. The error screen distinguishes API permission errors from connection failures.
 
-## Deploy to Azure (on demand, for demos)
+## Deploy to Azure (wakes on visit)
 
-Runs on Azure Container Apps, started for interviews and stopped otherwise. While stopped, the only cost is the small file share holding the database (a few rupees a month).
+Runs on Azure Container Apps and sleeps when nobody is using it. Opening the site wakes it: a "Waking up PulseDesk" screen shows the current step and a countdown (a cold start takes a few minutes), then the app opens. Once every tab has been closed for 3 minutes, the API and database stop again. While asleep, the only cost is the small file shares (a few rupees a month).
 
 | Piece | Where it runs |
 |---|---|
-| Frontend (nginx, public) | Container App `pulsedesk-web`; proxies `/api` to the backend |
+| Frontend (nginx, public) | Container App `pulsedesk-web`, scales to zero; proxies `/api` to the backend |
+| Waker | Sidecar in `pulsedesk-web` (`frontend/waker`): starts/stops the API and database through its managed identity |
 | Backend + Redis sidecar (internal only) | Container App `pulsedesk-api`, one replica |
 | Database | Container App `pulsedesk-db` (Postgres 16, internal TCP only) with its data on an Azure Files share |
 | Images | GitHub Container Registry, published by CI after the tests pass on `main` |
-| Safety net | Container Apps job `pulsedesk-autostop` stops everything nightly at 01:00 IST |
+| Safety net | Container Apps job `pulsedesk-autostop` stops the API and database nightly at 01:00 IST |
 
-Needs Azure CLI and Owner rights on the subscription (the auto-stop job gets a role assignment). No Docker needed on your machine.
+Visitor-started running time is capped at 1 hour a day (`wakeDailyCapMinutes` in `infra/main.bicep`); after that the site says the application is unavailable until midnight IST. `demo-up.ps1` sets an admin hold that skips the idle stop and the cap, so use it before an interview.
+
+Needs Azure CLI and Owner rights on the subscription (the auto-stop job and the waker get role assignments). No Docker needed on your machine.
 
 ```powershell
 az login
@@ -112,8 +115,8 @@ git push                                          # then wait for CI's "Docker i
 .\scripts\azure\deploy.ps1                        # deploys the images for the current commit
 .\scripts\seed-demo.ps1 -Base https://<url>/api/v1 # once, to load the demo org
 .\scripts\azure\custom-domain.ps1                 # once: serve it at pulsedesk.anshrai.in with free HTTPS
-.\scripts\azure\demo-up.ps1                       # before an interview (2-3 min)
-.\scripts\azure\demo-down.ps1                     # afterwards
+.\scripts\azure\demo-up.ps1                       # before an interview: starts it and keeps it awake for 2 hours
+.\scripts\azure\demo-down.ps1                     # afterwards (otherwise it sleeps on its own)
 ```
 
 - Azure pulls the GitHub packages `pulsedesk-api` and `pulsedesk-web` without credentials, so they must stay public (they inherit the public repo's visibility).
@@ -124,4 +127,4 @@ git push                                          # then wait for CI's "Docker i
 
 ## Tests
 
-`cd backend; mvn test` (needs Docker running; uses Testcontainers).
+`cd backend; mvn test` (needs Docker running; uses Testcontainers). Waker logic: `node --test frontend/waker`.
