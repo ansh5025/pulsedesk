@@ -1,0 +1,29 @@
+# Runs the backend and frontend as containers on top of docker-compose.yml, the same way they run on Azure.
+#   $env:PULSEDESK_JWT_SECRET = "<at least 32 characters>"
+#   docker compose -f docker-compose.yml -f docker-compose.app.yml up -d --build
+# Then open http://localhost:8081
+services:
+  backend:
+    image: pulsedesk-api:local
+    build: ./backend
+    depends_on: [postgres, redis]
+    environment:
+      PULSEDESK_DB_URL: jdbc:postgresql://postgres:5432/pulsedesk
+      PULSEDESK_DB_USER: pulsedesk
+      PULSEDESK_DB_PASSWORD: pulsedesk
+      PULSEDESK_REDIS_HOST: redis
+      PULSEDESK_RABBIT_HOST: rabbitmq
+      PULSEDESK_MAIL_HOST: mailpit
+      PULSEDESK_MESSAGING_ENABLED: "false"
+      PULSEDESK_JWT_SECRET: ${PULSEDESK_JWT_SECRET:?Set PULSEDESK_JWT_SECRET to at least 32 characters}
+      PULSEDESK_INVITE_URL: http://localhost:8081/accept-invite
+      SERVER_FORWARD_HEADERS_STRATEGY: native
+
+  frontend:
+    image: pulsedesk-web:local
+    build: ./frontend
+    depends_on: [backend]
+    environment:
+      BACKEND_URL: http://backend:8080
+    ports:
+      - "8081:80"

@@ -1,0 +1,54 @@
+spring:
+  application:
+    name: pulsedesk
+  datasource:
+    url: ${PULSEDESK_DB_URL:jdbc:postgresql://localhost:5432/pulsedesk}
+    username: ${PULSEDESK_DB_USER:pulsedesk}
+    password: ${PULSEDESK_DB_PASSWORD:pulsedesk}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  data:
+    redis:
+      host: ${PULSEDESK_REDIS_HOST:localhost}
+      port: ${PULSEDESK_REDIS_PORT:6379}
+  rabbitmq:
+    host: ${PULSEDESK_RABBIT_HOST:localhost}
+    port: ${PULSEDESK_RABBIT_PORT:5672}
+    username: ${PULSEDESK_RABBIT_USER:guest}
+    password: ${PULSEDESK_RABBIT_PASSWORD:guest}
+  mail:
+    host: ${PULSEDESK_MAIL_HOST:localhost}
+    port: ${PULSEDESK_MAIL_PORT:1025}
+    username: ${PULSEDESK_MAIL_USER:}
+    password: ${PULSEDESK_MAIL_PASSWORD:}
+
+management:
+  health:
+    rabbit:
+      enabled: ${PULSEDESK_MESSAGING_ENABLED:false}
+    mail:
+      enabled: ${PULSEDESK_MESSAGING_ENABLED:false}
+
+app:
+  jwt:
+    secret: ${PULSEDESK_JWT_SECRET}
+    issuer: pulsedesk
+    expiration-ms: 900000
+  monitoring:
+    enabled: true
+  sla:
+    enabled: true
+  cache:
+    analytics-ttl-seconds: 60
+  rate-limit:
+    login-max-attempts: 5
+    login-max-attempts-per-ip: 20
+    login-window-seconds: 900
+  messaging:
+    enabled: ${PULSEDESK_MESSAGING_ENABLED:false}
+    from: ${PULSEDESK_MAIL_FROM:no-reply@pulsedesk.local}
+    invite-base-url: ${PULSEDESK_INVITE_URL:http://localhost:3000/accept-invite}
+    max-attempts: 3
+    retry-backoff-ms: 1000
