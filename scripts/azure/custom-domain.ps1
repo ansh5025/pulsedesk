@@ -24,10 +24,11 @@ Write-Host "`nWaiting for the records to appear in public DNS (checks every 30 s
 $deadline = (Get-Date).AddMinutes($DnsTimeoutMinutes)
 $cnameOk = $false; $txtOk = $false
 while ((Get-Date) -lt $deadline -and -not ($cnameOk -and $txtOk)) {
-    $cname = Resolve-DnsName -Name $Domain -Type CNAME -Server 1.1.1.1 -DnsOnly -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'CNAME' }
-    $txt = Resolve-DnsName -Name "asuid.$Domain" -Type TXT -Server 1.1.1.1 -DnsOnly -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'TXT' }
+    # Accept a record once any major resolver serves it; one resolver can cache an old value for the whole TTL.
+    $cname = foreach ($dns in '8.8.8.8', '1.1.1.1') { Resolve-DnsName -Name $Domain -Type CNAME -Server $dns -DnsOnly -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'CNAME' } }
+    $txt = foreach ($dns in '8.8.8.8', '1.1.1.1') { Resolve-DnsName -Name "asuid.$Domain" -Type TXT -Server $dns -DnsOnly -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'TXT' } }
     $cnameOk = [bool]($cname | Where-Object { $_.NameHost.TrimEnd('.') -eq $app.fqdn })
-    $txtOk = [bool]($txt | Where-Object { $_.Strings -contains $app.verifyId })
+    $txtOk = [bool]($txt | Where-Object { ($_.Strings -join '') -eq $app.verifyId })
     Write-Host ("  {0:HH:mm:ss}  CNAME {1}  TXT {2}" -f (Get-Date), $(if ($cnameOk) { 'ok' } else { 'waiting' }), $(if ($txtOk) { 'ok' } else { 'waiting' }))
     if (-not ($cnameOk -and $txtOk)) { Start-Sleep -Seconds 30 }
 }
@@ -40,7 +41,7 @@ az containerapp hostname bind --resource-group $ResourceGroup --name $web --host
 Assert-Az "Binding $Domain"
 
 # Invitation emails and links should use the new address.
-az containerapp update --resource-group $ResourceGroup --name pulsedesk-api `
+az containerapp update --resource-group $ResourceGroup --name pulsedesk-api --container-name api `
     --set-env-vars "PULSEDESK_INVITE_URL=https://$Domain/accept-invite" --output none
 Assert-Az 'Updating the invite URL'
 

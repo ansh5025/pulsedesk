@@ -105,3 +105,8 @@ JwtAuthenticationFilter, custom principal, global @RestControllerAdvice, registr
 - Testcontainers pinned to 1.21.4 via testcontainers.version: Boot 3.3's 1.19 requests Docker API 1.32, rejected by Docker 29 on GitHub runners.
 - scripts/azure/custom-domain.ps1 binds pulsedesk.anshrai.in (CNAME pulsedesk -> web fqdn, TXT asuid.pulsedesk -> verification id) with a free managed cert and updates PULSEDESK_INVITE_URL. deploy.ps1 re-passes existing binding (customDomain/customDomainCertificateId params) so redeploys keep it.
 - Azure not deployed yet: user must az login and run deploy.ps1, then custom-domain.ps1.
+
+## Phase 10 - Live on Azure
+- Deployed 2026-11-25 to rg pulsedesk-rg, Japan East (student sub f3347f53...; tenant needs MFA: az login --tenant 7d76ad6e-...). Live: https://pulsedesk.anshrai.in (GoDaddy DNS: CNAME pulsedesk + TXT asuid.pulsedesk; asuid value is per-subscription, shared with ecommerce-api).
+- Lessons: student subs get SkuNotAvailable for Postgres B1ms in Central India/SE Asia/Korea Central; new subs default Container Apps env to Express (no sidecars) so env pinned to WorkloadProfiles; nginx needs proxy_http_version 1.1 (ACA ingress 426s HTTP/1.0); multi-container app updates need --container-name.
+- Credit ~INR 1,848 at deploy time. Stop with demo-down.ps1; nightly job stops at 01:00 IST.
