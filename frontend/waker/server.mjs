@@ -28,7 +28,7 @@ const config = {
 };
 
 // Persisted on a file share so the daily usage and holds survive the site scaling to zero.
-let state = { day: "", usedSeconds: 0, holdUntil: 0, history: [] };
+let state = { day: "", usedSeconds: 0, holdUntil: 0, startHistory: [] };
 // In memory only.
 const run = { startRequestedAt: 0, stopRequestedAt: 0, startedAtMs: 0, startWanted: false, lastActivityMs: Date.now() };
 let obs = { db: "Unknown", api: "Unknown", apiHealthy: false, dbOpen: false };
@@ -171,11 +171,15 @@ async function tick() {
       dirty = true;
     }
     if (phase === "ready" && run.startedAtMs) {
-      state.history = recordStart(state.history, (nowMs - run.startedAtMs) / 1000);
-      log(`Ready after ${Math.round((nowMs - run.startedAtMs) / 1000)} s`);
+      const seconds = (nowMs - run.startedAtMs) / 1000;
+      // Only time starts made here: for one begun elsewhere we only know when it was first noticed.
+      if (run.startRequestedAt) {
+        state.startHistory = recordStart(state.startHistory, seconds);
+        dirty = true;
+      }
+      log(`Ready after ${Math.round(seconds)} s`);
       run.startedAtMs = 0;
       run.startRequestedAt = 0;
-      dirty = true;
     }
     if (phase === "starting" && !run.startedAtMs) run.startedAtMs = nowMs; // started elsewhere, e.g. demo-up.ps1
     if (phase === "stopped") run.stopRequestedAt = 0;
@@ -204,7 +208,7 @@ function status() {
   const nowMs = Date.now();
   return describe({
     phase: currentPhase(nowMs), obs, held: held(nowMs), usedSeconds: state.usedSeconds, capSeconds: config.capSeconds,
-    startedAtMs: run.startedAtMs, estimateSeconds: estimateStartSeconds(state.history), nowMs,
+    startedAtMs: run.startedAtMs, estimateSeconds: estimateStartSeconds(state.startHistory), nowMs,
   });
 }
 
